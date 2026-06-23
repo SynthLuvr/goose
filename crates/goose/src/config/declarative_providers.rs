@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(config.fast_model, Some("glm-4.5-air".to_string()));
         assert!(config.preserves_thinking);
         assert_eq!(config.supports_streaming, Some(true));
-        assert_eq!(config.models[0].name, "glm-5.1");
+        assert_eq!(config.models[0].name, "glm-5.2");
 
         let env_vars = config.env_vars.as_ref().expect("env_vars should be set");
         assert_eq!(env_vars.len(), 1);
