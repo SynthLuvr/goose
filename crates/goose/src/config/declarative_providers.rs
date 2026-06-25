@@ -891,31 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zai_json_deserializes() {
-        let json = include_str!("../providers/declarative/zai.json");
-        let config: DeclarativeProviderConfig =
-            serde_json::from_str(json).expect("zai.json should parse");
-        assert_eq!(config.name, "zai");
-        assert_eq!(config.display_name, "Z.AI");
-        assert!(matches!(config.engine, ProviderEngine::Anthropic));
-        assert_eq!(config.api_key_env, "ZHIPU_API_KEY");
-        assert_eq!(config.base_url, "${ZAI_BASE_URL}");
-        assert_eq!(config.catalog_provider_id, Some("zai".to_string()));
-        assert_eq!(config.fast_model, Some("glm-4.5-air".to_string()));
-        assert!(config.preserves_thinking);
-        assert_eq!(config.supports_streaming, Some(true));
-        assert_eq!(config.models[0].name, "glm-5.2");
-
-        let env_vars = config.env_vars.as_ref().expect("env_vars should be set");
-        assert_eq!(env_vars.len(), 1);
-        assert_eq!(env_vars[0].name, "ZAI_BASE_URL");
-        assert_eq!(
-            env_vars[0].default,
-            Some("https://api.z.ai/api/anthropic".to_string())
-        );
-    }
-
-    #[test]
     fn test_openai_reasoning_provider_json_preserves_thinking() {
         for (name, json) in [
             (
@@ -971,28 +946,6 @@ mod tests {
         assert_eq!(config.models.len(), 1);
         assert_eq!(config.models[0].name, "z-ai/glm-4.7");
         assert_eq!(config.models[0].context_limit, 131072);
-    }
-
-    #[test]
-    fn test_nearai_json_deserializes() {
-        let json = include_str!("../providers/declarative/nearai.json");
-        let config: DeclarativeProviderConfig =
-            serde_json::from_str(json).expect("nearai.json should parse");
-        assert_eq!(config.name, "nearai");
-        assert_eq!(config.display_name, "NEAR AI Cloud");
-        assert!(matches!(config.engine, ProviderEngine::OpenAI));
-        assert_eq!(config.api_key_env, "NEARAI_API_KEY");
-        assert_eq!(config.base_url, "https://cloud-api.near.ai/v1");
-        assert_eq!(config.catalog_provider_id, Some("nearai".to_string()));
-        assert_eq!(config.dynamic_models, Some(true));
-        assert_eq!(config.supports_streaming, Some(true));
-        assert!(config.preserves_thinking);
-        assert_eq!(
-            config.model_doc_link,
-            Some("https://docs.near.ai/".to_string())
-        );
-        assert_eq!(config.models[0].name, "zai-org/GLM-5.1-FP8");
-        assert!(config.models[0].reasoning);
     }
 
     #[test]

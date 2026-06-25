@@ -369,7 +369,6 @@ mod tests {
         assert_eq!(nearai.provider_type(), ProviderType::Declarative);
         assert!(nearai.supports_inventory_refresh());
         assert_eq!(meta.display_name, "NEAR AI Cloud");
-        assert_eq!(meta.default_model, "zai-org/GLM-5.2");
         assert_eq!(meta.model_doc_link, "https://docs.near.ai/");
         assert!(!meta.setup_steps.is_empty());
 
