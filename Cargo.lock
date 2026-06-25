@@ -4886,7 +4886,6 @@ dependencies = [
  "which 8.0.3",
  "winapi",
  "wiremock",
- "zip 8.6.0",
 ]
 
 [[package]]
@@ -5054,7 +5053,6 @@ dependencies = [
  "chrono",
  "clap",
  "config",
- "fs2",
  "futures",
  "goose",
  "goose-mcp",
