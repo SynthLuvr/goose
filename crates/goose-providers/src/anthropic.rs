@@ -274,8 +274,8 @@ impl AnthropicProvider {
     }
 }
 
-/// Streams an Anthropic SSE response, guarded by the event-layer idle timeout
-/// so keepalive comment frames cannot mask a stalled stream.
+/// Streams an Anthropic SSE response with the idle-timeout guard so keepalive
+/// comment frames cannot mask a stalled stream.
 fn stream_anthropic_with_idle_timeout(
     response: Response,
     mut log: Option<Box<dyn RequestLogHandle>>,
@@ -773,92 +773,40 @@ mod tests {
         );
     }
 
-    /// Serves the #11679 failure signature on the Anthropic wire format:
-    /// healthy SSE frames, then keepalive comment frames forever. The bytes
-    /// keep arriving, so byte-level read timeouts never fire.
-    async fn serve_keepalive_masked_stall(mut sock: tokio::net::TcpStream) {
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut buf = [0u8; 8192];
-        let _ = sock.read(&mut buf).await;
-        let headers = concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "content-type: text/event-stream\r\n",
-            "transfer-encoding: chunked\r\n\r\n"
-        );
-        if sock.write_all(headers.as_bytes()).await.is_err() {
-            return;
-        }
-        let chunk = |data: &str| format!("{:x}\r\n{data}\r\n", data.len());
-        let frames = [
-            concat!(
-                "event: message_start\n",
-                r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":0}}}"#,
-                "\n\n"
-            ),
-            concat!(
-                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
-                "\n\n"
-            ),
-        ];
-        for frame in frames {
-            if sock.write_all(chunk(frame).as_bytes()).await.is_err() {
-                return;
-            }
-        }
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if sock
-                .write_all(chunk(": ping\n\n").as_bytes())
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-    }
-
+    /// The #11679 failure signature on the Anthropic wire format: healthy SSE
+    /// frames, then keepalive comment frames forever. Bytes keep flowing, so
+    /// byte-level read timeouts never fire.
     #[tokio::test]
     async fn keepalive_masked_stall_errors_instead_of_hanging() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
         use std::time::Duration;
-        use tokio::net::TcpListener;
-        use tokio_stream::StreamExt;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((sock, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(serve_keepalive_masked_stall(sock));
-            }
-        });
+        let addr = spawn_server(
+            vec![
+                Chunk::immediate(concat!(
+                    "event: message_start\n",
+                    r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+                    "\n\n"
+                )),
+                Chunk::immediate(concat!(
+                    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+                    "\n\n"
+                )),
+            ],
+            Tail::KeepaliveForever,
+        )
+        .await;
 
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = http
-            .post(format!("http://{addr}/v1/messages"))
-            .json(&json!({"model": "claude-sonnet-4-5", "stream": true, "messages": []}))
-            .send()
-            .await
-            .unwrap();
-        let mut stream = stream_anthropic_with_idle_timeout(response, None, 1);
+        let response = post_stream(
+            addr,
+            "/v1/messages",
+            json!({"model": "claude-sonnet-4-5", "stream": true, "messages": []}),
+        )
+        .await;
+        let stream = stream_anthropic_with_idle_timeout(response, None, 1);
 
-        let mut items = 0usize;
-        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(_) => items += 1,
-                    Err(e) => return Some(e),
-                }
-            }
-            None
-        })
-        .await
-        .expect("stream did not terminate within 15s");
-
-        let err = outcome.expect("stream ended without an error");
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        let err = err.expect("stream ended without an error");
         assert!(
             items > 0,
             "healthy frames should have been yielded before the stall"

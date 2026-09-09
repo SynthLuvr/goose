@@ -236,31 +236,28 @@ pub use super::http_status::{
 // Legacy alias kept for callers that haven't migrated their import path yet.
 pub use super::http_status::handle_response as handle_response_openai_compat;
 
-/// Default event-layer idle timeout for streaming responses (seconds): how
-/// long a stream may go without a data-bearing SSE line before it is
-/// considered stalled. Unlike reqwest's byte-level read timeout, SSE comment
-/// keepalives (`: ping`) and blank separator lines do not reset this deadline,
-/// so a provider that wedges mid-stream while emitting keepalives is detected
+/// Idle timeout for streaming responses: how long a stream may go without a
+/// data-bearing SSE line before it is considered stalled. SSE comment
+/// keepalives (`: ping`) and blank separators do not reset the deadline, so a
+/// provider that wedges mid-stream while emitting keepalives is detected
 /// instead of hanging the turn forever.
 pub(crate) const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
-/// Wraps a framed SSE line stream with the event-layer idle timeout, to be
-/// inserted between `LinesCodec` framing and the format parser.
-///
-/// The deadline is not enforced until the stream yields its first line, so
-/// time-to-first-token stays governed by the request timeout. Afterwards only
-/// data-bearing lines — anything that is not blank and does not start with
-/// `:` — reset the deadline; keepalive comment frames and blank separators
-/// cannot mask a stall. On timeout the stream errors with a retryable
+fn is_data_bearing_line(line: &str) -> bool {
+    !line.trim().is_empty() && !line.starts_with(':')
+}
+
+/// Wraps framed SSE lines with the idle timeout, between `LinesCodec` framing
+/// and the format parser. The deadline applies only after the first line, so
+/// time-to-first-token stays governed by the request timeout; afterwards only
+/// data-bearing lines reset it. On timeout the stream errors with a retryable
 /// [`ProviderError::NetworkError`].
 pub(crate) fn with_data_line_idle_timeout(
-    stream: impl Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+    mut stream: impl Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
     idle_timeout_secs: u64,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
     Box::pin(try_stream! {
-        let mut stream = stream;
-
         let first_line = match stream.next().await {
             Some(first) => first?,
             None => return,
@@ -272,7 +269,7 @@ pub(crate) fn with_data_line_idle_timeout(
             match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(Some(item)) => {
                     let line = item?;
-                    if !line.trim().is_empty() && !line.starts_with(':') {
+                    if is_data_bearing_line(&line) {
                         deadline = tokio::time::Instant::now() + idle_timeout;
                     }
                     yield line;
@@ -519,87 +516,45 @@ mod tests {
         );
     }
 
-    /// Serves the #11679 failure signature: healthy SSE data frames, then
-    /// keepalive comment frames forever, never terminating. At the byte level
-    /// the connection stays alive indefinitely, so byte-based read timeouts
-    /// never fire.
-    async fn serve_keepalive_masked_stall(mut sock: tokio::net::TcpStream) {
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut buf = [0u8; 8192];
-        let _ = sock.read(&mut buf).await;
-        let headers = concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "content-type: text/event-stream\r\n",
-            "transfer-encoding: chunked\r\n\r\n"
-        );
-        if sock.write_all(headers.as_bytes()).await.is_err() {
-            return;
-        }
-        let chunk = |data: &str| format!("{:x}\r\n{data}\r\n", data.len());
-        let delta = concat!(
-            r#"data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}"#,
-            "\n\n"
-        );
-        for data in [delta, delta] {
-            if sock.write_all(chunk(data).as_bytes()).await.is_err() {
-                return;
-            }
-        }
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if sock
-                .write_all(chunk(": ping\n\n").as_bytes())
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
+    fn chat_delta(content: &str) -> String {
+        let payload = json!({
+            "id": "1",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": null,
+            }],
+        });
+        format!("data: {payload}\n\n")
     }
 
+    /// The #11679 failure signature: healthy data frames, then keepalive
+    /// comment frames forever. Bytes keep flowing, so byte-based read
+    /// timeouts never fire.
     #[tokio::test]
     async fn keepalive_masked_stall_errors_instead_of_hanging() {
         use crate::retry::{should_retry, RetryConfig};
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
         use std::time::Duration;
-        use tokio::net::TcpListener;
-        use tokio_stream::StreamExt;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((sock, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(serve_keepalive_masked_stall(sock));
-            }
-        });
+        let delta = chat_delta("Hi");
+        let addr = spawn_server(
+            vec![Chunk::immediate(delta.clone()), Chunk::immediate(delta)],
+            Tail::KeepaliveForever,
+        )
+        .await;
 
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = http
-            .post(format!("http://{addr}/chat/completions"))
-            .json(&json!({"model": "m", "stream": true, "messages": []}))
-            .send()
-            .await
-            .unwrap();
-        let mut stream = stream_openai_compat_with_idle_timeout(response, None, 1).unwrap();
+        let response = post_stream(
+            addr,
+            "/chat/completions",
+            json!({"model": "m", "stream": true, "messages": []}),
+        )
+        .await;
+        let stream = stream_openai_compat_with_idle_timeout(response, None, 1).unwrap();
 
-        let mut items = 0usize;
-        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(_) => items += 1,
-                    Err(e) => return Some(e),
-                }
-            }
-            None
-        })
-        .await
-        .expect("stream did not terminate within 15s");
-
-        let err = outcome.expect("stream ended without an error");
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        let err = err.expect("stream ended without an error");
         assert!(
             items > 0,
             "healthy frames should have been yielded before the stall"
@@ -611,90 +566,35 @@ mod tests {
 
     #[tokio::test]
     async fn slow_but_live_data_lines_do_not_trip_the_idle_timeout() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
         use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::{TcpListener, TcpStream};
-        use tokio_stream::StreamExt;
 
-        // Data frames (with interleaved keepalive comments) every 300ms while
-        // the idle timeout is 1s: a live-but-slow stream must not be killed.
-        async fn serve(mut sock: TcpStream) {
-            use tokio::io::AsyncReadExt;
-
-            let mut buf = [0u8; 8192];
-            let _ = sock.read(&mut buf).await;
-            let headers = concat!(
-                "HTTP/1.1 200 OK\r\n",
-                "content-type: text/event-stream\r\n",
-                "transfer-encoding: chunked\r\n\r\n"
-            );
-            if sock.write_all(headers.as_bytes()).await.is_err() {
-                return;
-            }
-            let chunk = |data: &str| format!("{:x}\r\n{data}\r\n", data.len());
-            for i in 0..5 {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                if sock
-                    .write_all(chunk(": ping\n\n").as_bytes())
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                let delta = format!(
-                    concat!(
-                        r#"data: {{"id":"1","model":"m","choices":[{{"index":0,"delta":{{"role":"assistant","content":"Hi {}"}},"finish_reason":null}}]}}"#,
-                        "\n\n"
-                    ),
-                    i
-                );
-                if sock.write_all(chunk(&delta).as_bytes()).await.is_err() {
-                    return;
-                }
-            }
-            let _ = sock.write_all(chunk("data: [DONE]\n\n").as_bytes()).await;
-            let _ = sock.write_all(b"0\r\n\r\n").await;
+        // Data frames interleaved with keepalive comments every 300ms against
+        // a 1s idle timeout: a live-but-slow stream must not be killed.
+        let mut script = Vec::new();
+        for i in 0..5 {
+            script.push(Chunk {
+                after: Duration::from_millis(150),
+                body: ": ping\n\n".to_string(),
+            });
+            script.push(Chunk {
+                after: Duration::from_millis(150),
+                body: chat_delta(&format!("Hi {i}")),
+            });
         }
+        script.push(Chunk::immediate("data: [DONE]\n\n"));
+        let addr = spawn_server(script, Tail::Close).await;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((sock, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(serve(sock));
-            }
-        });
+        let response = post_stream(
+            addr,
+            "/chat/completions",
+            json!({"model": "m", "stream": true, "messages": []}),
+        )
+        .await;
+        let stream = stream_openai_compat_with_idle_timeout(response, None, 1).unwrap();
 
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = http
-            .post(format!("http://{addr}/chat/completions"))
-            .json(&json!({"model": "m", "stream": true, "messages": []}))
-            .send()
-            .await
-            .unwrap();
-        let mut stream = stream_openai_compat_with_idle_timeout(response, None, 1).unwrap();
-
-        let mut items = 0usize;
-        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(_) => items += 1,
-                    Err(e) => return Some(e),
-                }
-            }
-            None
-        })
-        .await
-        .expect("stream did not terminate within 15s");
-
-        assert!(
-            outcome.is_none(),
-            "live stream errored: {:?}",
-            outcome.unwrap()
-        );
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        assert!(err.is_none(), "live stream errored: {err:?}");
         assert!(items > 0, "data frames should have been yielded");
     }
 }
