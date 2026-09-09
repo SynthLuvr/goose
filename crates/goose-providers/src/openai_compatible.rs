@@ -259,20 +259,22 @@ const NON_PROGRESS_EVENT_TYPES: [&str; 5] = [
 ];
 
 /// Whether a framed SSE line carries model progress for the downstream
-/// parsers. Two shapes never count:
+/// parsers. Three shapes never count:
 ///
 /// - Structural heartbeats: comment frames, blank separators, control fields
 ///   (`event:`, `id:`, `retry:`), other extension fields, and empty `data:`
 ///   events — discarded by every wrapped parser.
 /// - Payloads whose `type` is one of [`NON_PROGRESS_EVENT_TYPES`]: lifecycle
-///   preambles and keepalive events, which yield no assistant output. Letting
-///   either shape arm or reset the deadline would either kill a slow first
-///   token mid-generation or mask the exact keepalive-hidden stall this
-///   watchdog exists to catch.
+///   preambles and keepalive events, which yield no assistant output.
+/// - Chat-completions chunks whose deltas carry no output (see
+///   [`chat_chunk_carries_output`]): role priming, empty strings, empty
+///   arrays, and finish-only frames.
 ///
-/// Everything else — nonempty `data:` values such as `[DONE]`, JSON payloads
-/// of any other type, and bare JSON frames, which the Responses parser
-/// accepts — counts as progress.
+/// Letting any of these arm or reset the deadline would either kill a slow
+/// first token mid-generation or mask the exact keepalive-hidden stall this
+/// watchdog exists to catch. Everything else — nonempty `data:` values such
+/// as `[DONE]`, JSON payloads of any other type, and bare JSON frames, which
+/// the Responses parser accepts — counts as progress.
 fn is_progress_line(line: &str) -> bool {
     let payload = match line.strip_prefix("data:") {
         Some(value) => value.trim(),
@@ -291,17 +293,55 @@ fn is_progress_line(line: &str) -> bool {
         if let Some(event_type) = value.get("type").and_then(Value::as_str) {
             return !NON_PROGRESS_EVENT_TYPES.contains(&event_type);
         }
+        if value.get("choices").is_some() {
+            return chat_chunk_carries_output(&value);
+        }
     }
     true
 }
 
+/// Whether a chat-completions chunk carries model output in any choice's
+/// delta. Gateways prime the stream with deltas that yield nothing —
+/// OpenRouter's first frame sets `content: ""` alongside the role — and
+/// finish-only or usage-only frames likewise produce no assistant output.
+/// Mirrors what the chat parser actually reads: `content`,
+/// `reasoning`/`reasoning_content` (nonempty strings, as `reasoning_text()`
+/// filters empties), `reasoning_details`, and `tool_calls`.
+fn chat_chunk_carries_output(value: &Value) -> bool {
+    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        let Some(delta) = choice.get("delta") else {
+            return false;
+        };
+        let nonempty_text = |key: &str| {
+            delta
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        };
+        nonempty_text("content")
+            || nonempty_text("reasoning")
+            || nonempty_text("reasoning_content")
+            || delta
+                .get("reasoning_details")
+                .and_then(Value::as_array)
+                .is_some_and(|details| !details.is_empty())
+            || delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+    })
+}
+
 /// Wraps framed SSE lines with the idle timeout, between `LinesCodec` framing
 /// and the format parser. The deadline arms only once the first
-/// model-progress line has arrived — lifecycle preambles and keepalives,
-/// whether comment frames or payload events, do not start the clock — so
-/// time-to-first-token stays governed by the request timeout; afterwards
-/// only progress lines reset it. On timeout the stream errors with a
-/// retryable [`ProviderError::NetworkError`].
+/// model-progress line has arrived — lifecycle preambles, keepalives, and
+/// no-op chat deltas do not start the clock — so time-to-first-token stays
+/// governed by the request timeout; afterwards only progress lines reset it.
+/// On timeout the stream errors with a retryable
+/// [`ProviderError::NetworkError`].
 pub(crate) fn with_sse_idle_timeout(
     mut stream: impl Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
     idle_timeout_secs: u64,
@@ -589,10 +629,13 @@ mod tests {
 
     #[test]
     fn sse_heartbeat_lines_are_not_progress() {
-        // Heartbeat shapes every downstream parser discards: comments, blank
+        // Shapes every downstream parser discards: comments, blank
         // separators, control fields, unknown extension fields, and empty
-        // `data:` events — plus payload-bearing keepalive and lifecycle
-        // preamble events, which yield no model output.
+        // `data:` events; payload-bearing keepalive and lifecycle preamble
+        // events, which yield no model output; and chat chunks whose deltas
+        // carry no output — role priming, empty strings and arrays
+        // (OpenRouter's first frame), finish-only frames, and the
+        // empty-choices usage chunk.
         for line in [
             ": ping",
             "",
@@ -608,6 +651,11 @@ mod tests {
             r#"data: {"type":"message_start","message":{}}"#,
             r#"data: {"type":"response.created","response":{}}"#,
             r#"data: {"type":"response.in_progress"}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning":"","reasoning_details":[]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
         ] {
             assert!(!is_progress_line(line), "{line:?} should not be progress");
         }
@@ -625,6 +673,11 @@ mod tests {
             r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#,
             r#"data: {"type":"response.output_item.added"}"#,
             r#"data: {"type":"response.output_text.delta","delta":"Hi"}"#,
+            // Chat chunks whose deltas carry output
+            r#"data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"thinking","thinking":"deep"}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":""}}]}}]}"#,
             // Unknown event types stay progress: only the fixed
             // NON_PROGRESS_EVENT_TYPES set is excluded, so a provider adding
             // a new output event cannot stall undetected.
@@ -864,5 +917,80 @@ mod tests {
             "stream with slow first token errored: {err:?}"
         );
         assert!(items > 0, "data frames should have been yielded");
+    }
+
+    /// Gateways (e.g. OpenRouter) prime the stream with an initial chunk
+    /// whose only delta is `content: ""`; the chat parser yields nothing for
+    /// it, so it must not arm the idle deadline — otherwise a first token
+    /// slower than the idle timeout would be killed mid-generation.
+    #[tokio::test]
+    async fn empty_delta_prelude_before_first_token_does_not_trip_the_idle_timeout() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
+        use std::time::Duration;
+
+        // Role-priming empty delta, then keepalives for 1.8s against a 1s
+        // idle timeout, then the first real token and a clean close.
+        let mut script = vec![Chunk::immediate(chat_delta(""))];
+        for _ in 0..3 {
+            script.push(Chunk {
+                after: Duration::from_millis(600),
+                body: ": ping\n\n".to_string(),
+            });
+        }
+        script.push(Chunk::immediate(chat_delta("Hi")));
+        script.push(Chunk::immediate("data: [DONE]\n\n"));
+        let addr = spawn_server(script, Tail::Close).await;
+
+        let response = post_stream(
+            addr,
+            "/chat/completions",
+            json!({"model": "m", "stream": true, "messages": []}),
+        )
+        .await;
+        let stream = stream_openai_compat_with_idle_timeout(response, None, 1).unwrap();
+
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        assert!(
+            err.is_none(),
+            "stream with empty-delta prelude errored: {err:?}"
+        );
+        assert!(items > 0, "data frames should have been yielded");
+    }
+
+    /// The inverse shape: after real output, a stream wedged behind
+    /// empty-delta chunks (a gateway's payload keepalives) yields nothing
+    /// and must trip the watchdog just like comment keepalives.
+    #[tokio::test]
+    async fn empty_delta_masked_stall_errors_instead_of_hanging() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
+        use std::time::Duration;
+
+        let addr = spawn_server(
+            vec![Chunk::immediate(chat_delta("Hi")), Chunk::immediate(chat_delta("Hi"))],
+            Tail::KeepaliveDataForever(
+                concat!(
+                    r#"data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+                    "\n\n"
+                ),
+            ),
+        )
+        .await;
+
+        let response = post_stream(
+            addr,
+            "/chat/completions",
+            json!({"model": "m", "stream": true, "messages": []}),
+        )
+        .await;
+        let stream = stream_openai_compat_with_idle_timeout(response, None, 1).unwrap();
+
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        let err = err.expect("stream ended without an error");
+        assert!(
+            items > 0,
+            "healthy frames should have been yielded before the stall"
+        );
+        assert!(err.to_string().contains("Stream stalled"), "got: {err}");
+        assert!(matches!(err, ProviderError::NetworkError(_)));
     }
 }
