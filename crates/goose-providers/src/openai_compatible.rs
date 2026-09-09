@@ -243,31 +243,66 @@ pub use super::http_status::handle_response as handle_response_openai_compat;
 /// instead of hanging the turn forever.
 pub(crate) const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
-/// Whether a framed SSE line carries progress for the downstream parsers:
-/// a `data:` field with a nonempty value — the only field any wrapped parser
-/// consumes — or a line that itself parses as JSON, which the Responses
-/// parser accepts as a bare frame. Comment frames, blank separators, control
-/// fields (`event:`, `id:`, `retry:`), other extension fields, and empty
-/// `data:` events are heartbeat shapes every parser discards; letting any of
-/// them reset the deadline would mask the exact keepalive-hidden stall this
-/// watchdog exists to catch. A heartbeat that carries a payload (e.g. a
-/// `data: {"type":"keepalive"}` event) still resets the deadline — telling it
-/// apart from progress needs the parser's payload knowledge, which this
-/// line-level watchdog does not have.
-fn is_data_bearing_line(line: &str) -> bool {
-    match line.strip_prefix("data:") {
-        Some(value) => !value.trim().is_empty(),
-        None => serde_json::from_str::<Value>(line).is_ok(),
+/// SSE payload event types that carry no model progress across the wrapped
+/// formats: lifecycle preambles that arrive at request acceptance and are
+/// recorded as metadata at most (`message_start`, `response.created`,
+/// `response.in_progress`), and payload-bearing keepalive events (`ping`,
+/// `keepalive`). Only this fixed, cross-format set is excluded — unknown
+/// event types still count as progress, so a provider adding a new output
+/// event cannot stall undetected.
+const NON_PROGRESS_EVENT_TYPES: [&str; 5] = [
+    "message_start",
+    "ping",
+    "response.created",
+    "response.in_progress",
+    "keepalive",
+];
+
+/// Whether a framed SSE line carries model progress for the downstream
+/// parsers. Two shapes never count:
+///
+/// - Structural heartbeats: comment frames, blank separators, control fields
+///   (`event:`, `id:`, `retry:`), other extension fields, and empty `data:`
+///   events — discarded by every wrapped parser.
+/// - Payloads whose `type` is one of [`NON_PROGRESS_EVENT_TYPES`]: lifecycle
+///   preambles and keepalive events, which yield no assistant output. Letting
+///   either shape arm or reset the deadline would either kill a slow first
+///   token mid-generation or mask the exact keepalive-hidden stall this
+///   watchdog exists to catch.
+///
+/// Everything else — nonempty `data:` values such as `[DONE]`, JSON payloads
+/// of any other type, and bare JSON frames, which the Responses parser
+/// accepts — counts as progress.
+fn is_progress_line(line: &str) -> bool {
+    let payload = match line.strip_prefix("data:") {
+        Some(value) => value.trim(),
+        None => {
+            if serde_json::from_str::<Value>(line).is_ok() {
+                line.trim()
+            } else {
+                return false;
+            }
+        }
+    };
+    if payload.is_empty() {
+        return false;
     }
+    if let Ok(value) = serde_json::from_str::<Value>(payload) {
+        if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+            return !NON_PROGRESS_EVENT_TYPES.contains(&event_type);
+        }
+    }
+    true
 }
 
 /// Wraps framed SSE lines with the idle timeout, between `LinesCodec` framing
-/// and the format parser. The deadline arms only once the first data-bearing
-/// line has arrived, so time-to-first-token stays governed by the request
-/// timeout and pre-first-token keepalives cannot start the clock; afterwards
-/// only data-bearing lines reset it. On timeout the stream errors with a
+/// and the format parser. The deadline arms only once the first
+/// model-progress line has arrived — lifecycle preambles and keepalives,
+/// whether comment frames or payload events, do not start the clock — so
+/// time-to-first-token stays governed by the request timeout; afterwards
+/// only progress lines reset it. On timeout the stream errors with a
 /// retryable [`ProviderError::NetworkError`].
-pub(crate) fn with_data_line_idle_timeout(
+pub(crate) fn with_sse_idle_timeout(
     mut stream: impl Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
     idle_timeout_secs: u64,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>> {
@@ -283,7 +318,7 @@ pub(crate) fn with_data_line_idle_timeout(
             match next {
                 Ok(Some(item)) => {
                     let line = item?;
-                    if is_data_bearing_line(&line) {
+                    if is_progress_line(&line) {
                         deadline = Some(tokio::time::Instant::now() + idle_timeout);
                     }
                     yield line;
@@ -291,9 +326,9 @@ pub(crate) fn with_data_line_idle_timeout(
                 Ok(None) => break,
                 Err(_) => {
                     let err = ProviderError::NetworkError(format!(
-                        "Stream stalled: no data-bearing SSE line received for \
-                         {idle_timeout_secs}s (keepalive comment frames do not count \
-                         as progress)"
+                        "Stream stalled: no SSE progress line received for \
+                         {idle_timeout_secs}s (keepalives and lifecycle events \
+                         do not count as progress)"
                     ));
                     Err::<(), anyhow::Error>(err.into())?;
                 }
@@ -321,7 +356,7 @@ fn stream_openai_compat_with_idle_timeout(
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        let timed_lines = with_data_line_idle_timeout(framed, idle_timeout_secs);
+        let timed_lines = with_sse_idle_timeout(framed, idle_timeout_secs);
         let message_stream = response_to_streaming_message(timed_lines);
         pin!(message_stream);
         while let Some(message) = message_stream.next().await {
@@ -354,7 +389,7 @@ fn stream_responses_compat_with_idle_timeout(
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        let timed_lines = with_data_line_idle_timeout(framed, idle_timeout_secs);
+        let timed_lines = with_sse_idle_timeout(framed, idle_timeout_secs);
         let message_stream = responses_api_to_streaming_message(timed_lines);
         pin!(message_stream);
         while let Some(message) = message_stream.next().await {
@@ -553,10 +588,11 @@ mod tests {
     }
 
     #[test]
-    fn sse_heartbeat_lines_are_not_data_bearing() {
+    fn sse_heartbeat_lines_are_not_progress() {
         // Heartbeat shapes every downstream parser discards: comments, blank
         // separators, control fields, unknown extension fields, and empty
-        // `data:` events.
+        // `data:` events — plus payload-bearing keepalive and lifecycle
+        // preamble events, which yield no model output.
         for line in [
             ": ping",
             "",
@@ -567,23 +603,34 @@ mod tests {
             "x-heartbeat: ping",
             "data:",
             "data:   ",
+            r#"data: {"type":"ping"}"#,
+            r#"data: {"type":"keepalive"}"#,
+            r#"data: {"type":"message_start","message":{}}"#,
+            r#"data: {"type":"response.created","response":{}}"#,
+            r#"data: {"type":"response.in_progress"}"#,
         ] {
-            assert!(
-                !is_data_bearing_line(line),
-                "{line:?} should be a keepalive"
-            );
+            assert!(!is_progress_line(line), "{line:?} should not be progress");
         }
     }
 
     #[test]
-    fn payload_lines_are_data_bearing() {
+    fn model_output_lines_are_progress() {
         for line in [
             "data: {\"a\":1}",
             "data:{\"a\":1}", // space after the colon is optional
             "data: [DONE]",
-            "{\"a\":1}", // bare JSON frame, accepted by the Responses parser
+            r#"{"a":1}"#, // bare JSON frame, accepted by the Responses parser
+            // Output-bearing events from every wrapped format
+            r#"data: {"type":"content_block_start"}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#,
+            r#"data: {"type":"response.output_item.added"}"#,
+            r#"data: {"type":"response.output_text.delta","delta":"Hi"}"#,
+            // Unknown event types stay progress: only the fixed
+            // NON_PROGRESS_EVENT_TYPES set is excluded, so a provider adding
+            // a new output event cannot stall undetected.
+            r#"data: {"type":"some_future_output_event"}"#,
         ] {
-            assert!(is_data_bearing_line(line), "{line:?} should be payload");
+            assert!(is_progress_line(line), "{line:?} should be progress");
         }
     }
 
@@ -634,6 +681,11 @@ mod tests {
         format!("data: {payload}\n\n")
     }
 
+    /// A framed Responses payload event of the given type.
+    fn responses_event(event_type: &str) -> String {
+        format!("data: {{\"type\":\"{event_type}\"}}\n\n")
+    }
+
     /// The Responses API route (GPT-5/GPT-6/o-series, Databricks Responses
     /// streams) shares the #11679 failure signature; the watchdog must apply
     /// there too, not only to Chat Completions.
@@ -665,6 +717,81 @@ mod tests {
         );
         assert!(err.to_string().contains("Stream stalled"), "got: {err}");
         assert!(matches!(err, ProviderError::NetworkError(_)));
+    }
+
+    /// A stall bridged by payload-bearing keepalive events — the Responses
+    /// API's own `data: {"type":"keepalive"}` frames — must be detected too,
+    /// not only comment-frame keepalives.
+    #[tokio::test]
+    async fn keepalive_payload_masked_stall_errors_instead_of_hanging() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
+        use std::time::Duration;
+
+        let delta = responses_delta("Hi");
+        let addr = spawn_server(
+            vec![Chunk::immediate(delta.clone()), Chunk::immediate(delta)],
+            Tail::KeepaliveDataForever("data: {\"type\":\"keepalive\"}\n\n"),
+        )
+        .await;
+
+        let response = post_stream(
+            addr,
+            "/responses",
+            json!({"model": "m", "stream": true, "input": []}),
+        )
+        .await;
+        let stream = stream_responses_compat_with_idle_timeout(response, None, 1).unwrap();
+
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        let err = err.expect("stream ended without an error");
+        assert!(
+            items > 0,
+            "healthy frames should have been yielded before the stall"
+        );
+        assert!(err.to_string().contains("Stream stalled"), "got: {err}");
+        assert!(matches!(err, ProviderError::NetworkError(_)));
+    }
+
+    /// Lifecycle preambles (`response.created`) and keepalive events arrive
+    /// before the first token on the Responses route; neither carries model
+    /// output, so they must not arm the idle deadline — otherwise a first
+    /// token slower than the idle timeout would be killed mid-generation.
+    #[tokio::test]
+    async fn lifecycle_prelude_before_first_token_does_not_trip_the_idle_timeout() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
+        use std::time::Duration;
+
+        // Preamble + keepalives for ~1.8s against a 1s idle timeout, then the
+        // first data frame and a clean close.
+        let created = concat!(
+            r#"data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"m","output":[]}}"#,
+            "\n\n"
+        );
+        let mut script = vec![Chunk::immediate(created)];
+        for _ in 0..3 {
+            script.push(Chunk {
+                after: Duration::from_millis(600),
+                body: responses_event("keepalive"),
+            });
+        }
+        script.push(Chunk::immediate(responses_delta("Hi")));
+        script.push(Chunk::immediate("data: [DONE]\n\n"));
+        let addr = spawn_server(script, Tail::Close).await;
+
+        let response = post_stream(
+            addr,
+            "/responses",
+            json!({"model": "m", "stream": true, "input": []}),
+        )
+        .await;
+        let stream = stream_responses_compat_with_idle_timeout(response, None, 1).unwrap();
+
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        assert!(
+            err.is_none(),
+            "stream with slow first token errored: {err:?}"
+        );
+        assert!(items > 0, "data frames should have been yielded");
     }
 
     #[tokio::test]

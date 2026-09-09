@@ -35,6 +35,10 @@ pub(crate) enum Tail {
     /// Emit `: ping` frames forever without terminating the response: the
     /// connection stays byte-alive while no data ever arrives.
     KeepaliveForever,
+    /// Emit payload-bearing keepalive events forever without terminating the
+    /// response: byte-alive like `KeepaliveForever`, but with `data:` frames
+    /// a naive watchdog would count as progress.
+    KeepaliveDataForever(&'static str),
     /// Terminate the chunked body and close the connection.
     Close,
 }
@@ -77,6 +81,12 @@ async fn serve(mut sock: TcpStream, script: Vec<Chunk>, tail: Tail) {
                 .await
                 .is_err()
             {
+                return;
+            }
+        },
+        Tail::KeepaliveDataForever(frame) => loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if sock.write_all(chunk(frame).as_bytes()).await.is_err() {
                 return;
             }
         },
