@@ -2,12 +2,12 @@ use crate::api_client::{AuthMethod, TlsConfig};
 use crate::base::ProviderDescriptor;
 use crate::declarative::{DeclarativeProviderConfig, KeyResolver};
 use crate::errors::ProviderError;
-use crate::request_log::{start_log, LoggerHandleExt};
+use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
 use anyhow::Result;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use reqwest::StatusCode;
+use reqwest::{Response, StatusCode};
 use serde_json::Value;
 use std::io;
 use tokio::pin;
@@ -19,7 +19,9 @@ use super::formats::anthropic::{
     create_request_for_model, response_to_streaming_message, AnthropicFormatOptions,
     ANTHROPIC_PROVIDER_NAME,
 };
-use super::openai_compatible::handle_status;
+use super::openai_compatible::{
+    handle_status, with_data_line_idle_timeout, STREAM_IDLE_TIMEOUT_SECS,
+};
 use super::retry::ProviderRetry;
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
@@ -197,18 +199,11 @@ impl AnthropicProvider {
             .inspect_err(|e| {
                 let _ = log.error(e);
             })?;
-        let stream = response.bytes_stream().map_err(io::Error::other);
-        Ok(Box::pin(try_stream! {
-            let reader = StreamReader::new(stream);
-            let framed = tokio_util::codec::FramedRead::new(reader, tokio_util::codec::LinesCodec::new()).map_err(anyhow::Error::from);
-            let messages = response_to_streaming_message(framed);
-            pin!(messages);
-            while let Some(message) = futures::StreamExt::next(&mut messages).await {
-                let (message, usage) = message.map_err(ProviderError::from_stream_error)?;
-                log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
-                yield (message, usage);
-            }
-        }))
+        Ok(stream_anthropic_with_idle_timeout(
+            response,
+            log,
+            STREAM_IDLE_TIMEOUT_SECS,
+        ))
     }
 
     async fn fetch_models_from_api(&self) -> Result<Vec<String>, ProviderError> {
@@ -277,6 +272,28 @@ impl AnthropicProvider {
         models.sort();
         Ok(models)
     }
+}
+
+/// Streams an Anthropic SSE response, guarded by the event-layer idle timeout
+/// so keepalive comment frames cannot mask a stalled stream.
+fn stream_anthropic_with_idle_timeout(
+    response: Response,
+    mut log: Option<Box<dyn RequestLogHandle>>,
+    idle_timeout_secs: u64,
+) -> MessageStream {
+    let stream = response.bytes_stream().map_err(io::Error::other);
+    Box::pin(try_stream! {
+        let reader = StreamReader::new(stream);
+        let framed = tokio_util::codec::FramedRead::new(reader, tokio_util::codec::LinesCodec::new()).map_err(anyhow::Error::from);
+        let timed_lines = with_data_line_idle_timeout(framed, idle_timeout_secs);
+        let messages = response_to_streaming_message(timed_lines);
+        pin!(messages);
+        while let Some(message) = futures::StreamExt::next(&mut messages).await {
+            let (message, usage) = message.map_err(ProviderError::from_stream_error)?;
+            log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
+            yield (message, usage);
+        }
+    })
 }
 
 impl ProviderDescriptor for AnthropicProvider {
@@ -754,5 +771,99 @@ mod tests {
             "expected Authentication error, got: {:?}",
             err
         );
+    }
+
+    /// Serves the #11679 failure signature on the Anthropic wire format:
+    /// healthy SSE frames, then keepalive comment frames forever. The bytes
+    /// keep arriving, so byte-level read timeouts never fire.
+    async fn serve_keepalive_masked_stall(mut sock: tokio::net::TcpStream) {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = [0u8; 8192];
+        let _ = sock.read(&mut buf).await;
+        let headers = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "content-type: text/event-stream\r\n",
+            "transfer-encoding: chunked\r\n\r\n"
+        );
+        if sock.write_all(headers.as_bytes()).await.is_err() {
+            return;
+        }
+        let chunk = |data: &str| format!("{:x}\r\n{data}\r\n", data.len());
+        let frames = [
+            concat!(
+                "event: message_start\n",
+                r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+                "\n\n"
+            ),
+            concat!(
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+                "\n\n"
+            ),
+        ];
+        for frame in frames {
+            if sock.write_all(chunk(frame).as_bytes()).await.is_err() {
+                return;
+            }
+        }
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if sock
+                .write_all(chunk(": ping\n\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalive_masked_stall_errors_instead_of_hanging() {
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio_stream::StreamExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(serve_keepalive_masked_stall(sock));
+            }
+        });
+
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = http
+            .post(format!("http://{addr}/v1/messages"))
+            .json(&json!({"model": "claude-sonnet-4-5", "stream": true, "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = stream_anthropic_with_idle_timeout(response, None, 1);
+
+        let mut items = 0usize;
+        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(_) => items += 1,
+                    Err(e) => return Some(e),
+                }
+            }
+            None
+        })
+        .await
+        .expect("stream did not terminate within 15s");
+
+        let err = outcome.expect("stream ended without an error");
+        assert!(
+            items > 0,
+            "healthy frames should have been yielded before the stall"
+        );
+        assert!(err.to_string().contains("Stream stalled"), "got: {err}");
+        assert!(matches!(err, ProviderError::NetworkError(_)));
     }
 }
