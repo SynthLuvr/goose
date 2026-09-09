@@ -248,29 +248,29 @@ fn is_data_bearing_line(line: &str) -> bool {
 }
 
 /// Wraps framed SSE lines with the idle timeout, between `LinesCodec` framing
-/// and the format parser. The deadline applies only after the first line, so
-/// time-to-first-token stays governed by the request timeout; afterwards only
-/// data-bearing lines reset it. On timeout the stream errors with a retryable
-/// [`ProviderError::NetworkError`].
+/// and the format parser. The deadline arms only once the first data-bearing
+/// line has arrived, so time-to-first-token stays governed by the request
+/// timeout and pre-first-token keepalives cannot start the clock; afterwards
+/// only data-bearing lines reset it. On timeout the stream errors with a
+/// retryable [`ProviderError::NetworkError`].
 pub(crate) fn with_data_line_idle_timeout(
     mut stream: impl Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
     idle_timeout_secs: u64,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
     Box::pin(try_stream! {
-        let first_line = match stream.next().await {
-            Some(first) => first?,
-            None => return,
-        };
-        yield first_line;
-        let mut deadline = tokio::time::Instant::now() + idle_timeout;
+        let mut deadline: Option<tokio::time::Instant> = None;
 
         loop {
-            match tokio::time::timeout_at(deadline, stream.next()).await {
+            let next = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, stream.next()).await,
+                None => Ok(stream.next().await),
+            };
+            match next {
                 Ok(Some(item)) => {
                     let line = item?;
                     if is_data_bearing_line(&line) {
-                        deadline = tokio::time::Instant::now() + idle_timeout;
+                        deadline = Some(tokio::time::Instant::now() + idle_timeout);
                     }
                     yield line;
                 }
@@ -595,6 +595,44 @@ mod tests {
 
         let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
         assert!(err.is_none(), "live stream errored: {err:?}");
+        assert!(items > 0, "data frames should have been yielded");
+    }
+
+    /// Keepalives sent while the model is still producing its first token are
+    /// a liveness signal, not a stall: the deadline must not start until the
+    /// first data-bearing line arrives, even when the keepalive prelude alone
+    /// outlasts the idle timeout.
+    #[tokio::test]
+    async fn keepalive_prelude_before_first_token_does_not_trip_the_idle_timeout() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
+        use std::time::Duration;
+
+        // Keepalives for 1.8s against a 1s idle timeout, then the first data
+        // frame and a clean close.
+        let mut script = Vec::new();
+        for _ in 0..3 {
+            script.push(Chunk {
+                after: Duration::from_millis(600),
+                body: ": ping\n\n".to_string(),
+            });
+        }
+        script.push(Chunk::immediate(chat_delta("Hi")));
+        script.push(Chunk::immediate("data: [DONE]\n\n"));
+        let addr = spawn_server(script, Tail::Close).await;
+
+        let response = post_stream(
+            addr,
+            "/chat/completions",
+            json!({"model": "m", "stream": true, "messages": []}),
+        )
+        .await;
+        let stream = stream_openai_compat_with_idle_timeout(response, None, 1).unwrap();
+
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        assert!(
+            err.is_none(),
+            "stream with slow first token errored: {err:?}"
+        );
         assert!(items > 0, "data frames should have been yielded");
     }
 }
