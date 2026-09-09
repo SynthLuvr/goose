@@ -243,8 +243,22 @@ pub use super::http_status::handle_response as handle_response_openai_compat;
 /// instead of hanging the turn forever.
 pub(crate) const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
+/// Whether a framed SSE line carries progress for the downstream parsers:
+/// a `data:` field with a nonempty value — the only field any wrapped parser
+/// consumes — or a line that itself parses as JSON, which the Responses
+/// parser accepts as a bare frame. Comment frames, blank separators, control
+/// fields (`event:`, `id:`, `retry:`), other extension fields, and empty
+/// `data:` events are heartbeat shapes every parser discards; letting any of
+/// them reset the deadline would mask the exact keepalive-hidden stall this
+/// watchdog exists to catch. A heartbeat that carries a payload (e.g. a
+/// `data: {"type":"keepalive"}` event) still resets the deadline — telling it
+/// apart from progress needs the parser's payload knowledge, which this
+/// line-level watchdog does not have.
 fn is_data_bearing_line(line: &str) -> bool {
-    !line.trim().is_empty() && !line.starts_with(':')
+    match line.strip_prefix("data:") {
+        Some(value) => !value.trim().is_empty(),
+        None => serde_json::from_str::<Value>(line).is_ok(),
+    }
 }
 
 /// Wraps framed SSE lines with the idle timeout, between `LinesCodec` framing
@@ -323,7 +337,15 @@ fn stream_openai_compat_with_idle_timeout(
 
 pub fn stream_responses_compat(
     response: Response,
+    log: Option<Box<dyn RequestLogHandle>>,
+) -> Result<MessageStream, ProviderError> {
+    stream_responses_compat_with_idle_timeout(response, log, STREAM_IDLE_TIMEOUT_SECS)
+}
+
+fn stream_responses_compat_with_idle_timeout(
+    response: Response,
     mut log: Option<Box<dyn RequestLogHandle>>,
+    idle_timeout_secs: u64,
 ) -> Result<MessageStream, ProviderError> {
     let stream = response.bytes_stream().map_err(std::io::Error::other);
 
@@ -332,7 +354,8 @@ pub fn stream_responses_compat(
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        let message_stream = responses_api_to_streaming_message(framed);
+        let timed_lines = with_data_line_idle_timeout(framed, idle_timeout_secs);
+        let message_stream = responses_api_to_streaming_message(timed_lines);
         pin!(message_stream);
         while let Some(message) = message_stream.next().await {
             let (message, usage) = message.map_err(|e|
@@ -529,6 +552,41 @@ mod tests {
         format!("data: {payload}\n\n")
     }
 
+    #[test]
+    fn sse_heartbeat_lines_are_not_data_bearing() {
+        // Heartbeat shapes every downstream parser discards: comments, blank
+        // separators, control fields, unknown extension fields, and empty
+        // `data:` events.
+        for line in [
+            ": ping",
+            "",
+            "   ",
+            "event: ping",
+            "id: 7",
+            "retry: 3000",
+            "x-heartbeat: ping",
+            "data:",
+            "data:   ",
+        ] {
+            assert!(
+                !is_data_bearing_line(line),
+                "{line:?} should be a keepalive"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_lines_are_data_bearing() {
+        for line in [
+            "data: {\"a\":1}",
+            "data:{\"a\":1}", // space after the colon is optional
+            "data: [DONE]",
+            "{\"a\":1}", // bare JSON frame, accepted by the Responses parser
+        ] {
+            assert!(is_data_bearing_line(line), "{line:?} should be payload");
+        }
+    }
+
     /// The #11679 failure signature: healthy data frames, then keepalive
     /// comment frames forever. Bytes keep flowing, so byte-based read
     /// timeouts never fire.
@@ -562,6 +620,51 @@ mod tests {
         assert!(err.to_string().contains("Stream stalled"), "got: {err}");
         assert!(matches!(err, ProviderError::NetworkError(_)));
         assert!(should_retry(&err, &RetryConfig::default()));
+    }
+
+    fn responses_delta(content: &str) -> String {
+        let payload = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "m1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": content,
+        });
+        format!("data: {payload}\n\n")
+    }
+
+    /// The Responses API route (GPT-5/GPT-6/o-series, Databricks Responses
+    /// streams) shares the #11679 failure signature; the watchdog must apply
+    /// there too, not only to Chat Completions.
+    #[tokio::test]
+    async fn keepalive_masked_stall_errors_instead_of_hanging_on_responses_streams() {
+        use crate::sse_test_harness::{drain_within, post_stream, spawn_server, Chunk, Tail};
+        use std::time::Duration;
+
+        let delta = responses_delta("Hi");
+        let addr = spawn_server(
+            vec![Chunk::immediate(delta.clone()), Chunk::immediate(delta)],
+            Tail::KeepaliveForever,
+        )
+        .await;
+
+        let response = post_stream(
+            addr,
+            "/responses",
+            json!({"model": "m", "stream": true, "input": []}),
+        )
+        .await;
+        let stream = stream_responses_compat_with_idle_timeout(response, None, 1).unwrap();
+
+        let (items, err) = drain_within(stream, Duration::from_secs(15)).await;
+        let err = err.expect("stream ended without an error");
+        assert!(
+            items > 0,
+            "healthy frames should have been yielded before the stall"
+        );
+        assert!(err.to_string().contains("Stream stalled"), "got: {err}");
+        assert!(matches!(err, ProviderError::NetworkError(_)));
     }
 
     #[tokio::test]
